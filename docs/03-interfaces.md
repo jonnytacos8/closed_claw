@@ -1,208 +1,204 @@
 # 03 — Internal Service Interfaces
 
-This document defines the service interfaces OpenClaw will call in the MVP. All endpoints are internal — no public internet egress.
+This document defines the service interfaces and provides the TypeScript types a coding agent must create in `extensions/rag-internal/src/types.ts`.
 
 ---
 
 ## A) RAG Query Endpoint
 
-The internal RAG service indexes SharePoint and enforces user-level security trimming. OpenClaw calls it to retrieve relevant document chunks for a user's query.
-
 ### Contract
 
 | Field | Value |
 |-------|-------|
-| **Protocol** | HTTPS (internal TLS) |
+| **URL** | `${RAG_ENDPOINT_URL}` (env var, e.g., `https://<rag-host>/api/v1/search`) |
 | **Method** | `POST` |
-| **Path** | `/api/v1/search` |
-| **Authentication** | `Authorization: Bearer <delegated_user_token>` (on-behalf-of token scoped to the RAG service) |
+| **Auth** | `Authorization: Bearer <delegated_user_token>` (OBO token — see doc 04) |
 | **Content-Type** | `application/json` |
-| **Timeout** | 10s (OpenClaw-side; configurable) |
+| **Timeout** | 10s (configurable in client.ts) |
 
-### Request
+### TypeScript Types to Create (`extensions/rag-internal/src/types.ts`)
+
+```typescript
+// === RAG Request ===
+export type RagSearchRequest = {
+  query: string;
+  filters?: {
+    libraries?: string[];
+    file_types?: string[];
+    modified_after?: string; // ISO 8601
+  };
+  max_results?: number;       // default 10, max 25
+  include_citations?: boolean; // default true
+  user_context: {
+    upn: string;               // must match delegated token's upn claim
+  };
+};
+
+// === RAG Response ===
+export type RagSearchResponse = {
+  results: RagChunk[];
+  total_matches: number;
+  query_id: string;           // correlation ID for RAG-side audit
+  truncated: boolean;
+};
+
+export type RagChunk = {
+  chunk_id: string;
+  document_id: string;        // SharePoint item ID
+  document_title: string;
+  document_url: string;       // SharePoint webUrl — REQUIRED for citations
+  library: string;
+  chunk_text: string;         // max ~2000 chars
+  chunk_index: number;
+  total_chunks: number;
+  relevance_score: number;    // 0.0–1.0
+  metadata: RagChunkMetadata;
+};
+
+export type RagChunkMetadata = {
+  file_type: string;          // .xlsx, .csv, .docx, .pdf, .pptx
+  sheet_name?: string | null;
+  cell_range?: string | null;
+  page_number?: number | null;
+  section_heading?: string | null;
+  last_modified: string;      // ISO 8601
+  last_modified_by?: string;
+  dlp_labels?: string[];
+  content_type?: "table" | "text" | "formula" | "mixed";
+};
+```
+
+### Example Request
 
 ```json
 {
   "query": "What drove the variance in Q3 COGS vs budget?",
   "filters": {
     "libraries": ["finance-models", "budget-2025"],
-    "file_types": [".xlsx", ".csv", ".docx", ".pdf"],
-    "modified_after": "2025-01-01T00:00:00Z"
+    "file_types": [".xlsx", ".csv", ".docx", ".pdf"]
   },
   "max_results": 10,
   "include_citations": true,
-  "user_context": {
-    "upn": "jane.doe@contoso.com"
-  }
+  "user_context": { "upn": "jane.doe@contoso.com" }
 }
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `query` | string | Yes | Natural language search query |
-| `filters.libraries` | string[] | No | Scoped SharePoint document library names. If omitted, searches all libraries the user has access to. |
-| `filters.file_types` | string[] | No | File extension filter |
-| `filters.modified_after` | ISO 8601 | No | Recency filter |
-| `max_results` | integer | No | Max chunks to return (default 10, max 25) |
-| `include_citations` | boolean | No | Whether to return `webUrl` for each source |
-| `user_context.upn` | string | Yes | User principal name, used for security trimming if token-based trimming is supplemented by explicit UPN |
-
-### Response
+### Example Response
 
 ```json
 {
-  "results": [
-    {
-      "chunk_id": "abc-123",
-      "document_id": "doc-456",
-      "document_title": "Q3 2025 Variance Analysis.xlsx",
-      "document_url": "https://contoso.sharepoint.com/sites/finance/Shared%20Documents/Q3%202025%20Variance%20Analysis.xlsx",
-      "library": "finance-models",
-      "chunk_text": "COGS increased 12% vs budget driven by raw material price escalation in copper (+18% YoY) and logistics surcharges...",
-      "chunk_index": 3,
-      "total_chunks": 7,
-      "relevance_score": 0.87,
-      "metadata": {
-        "sheet_name": "COGS Detail",
-        "cell_range": "A1:F45",
-        "file_type": ".xlsx",
-        "last_modified": "2025-10-15T14:30:00Z",
-        "dlp_labels": ["confidential"]
-      }
+  "results": [{
+    "chunk_id": "abc-123",
+    "document_id": "doc-456",
+    "document_title": "Q3 2025 Variance Analysis.xlsx",
+    "document_url": "https://contoso.sharepoint.com/sites/finance/Shared%20Documents/Q3%202025%20Variance%20Analysis.xlsx",
+    "library": "finance-models",
+    "chunk_text": "COGS increased 12% vs budget driven by raw material price escalation in copper (+18% YoY)...",
+    "chunk_index": 3,
+    "total_chunks": 7,
+    "relevance_score": 0.87,
+    "metadata": {
+      "sheet_name": "COGS Detail",
+      "cell_range": "A1:F45",
+      "file_type": ".xlsx",
+      "last_modified": "2025-10-15T14:30:00Z",
+      "dlp_labels": ["confidential"],
+      "content_type": "table"
     }
-  ],
+  }],
   "total_matches": 4,
   "query_id": "qry-789",
   "truncated": false
 }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `results[].chunk_id` | string | Unique chunk identifier |
-| `results[].document_id` | string | SharePoint item ID |
-| `results[].document_title` | string | Human-readable document name |
-| `results[].document_url` | string | SharePoint `webUrl` — used for citations |
-| `results[].library` | string | Source library name |
-| `results[].chunk_text` | string | Extracted text content (max ~2000 chars) |
-| `results[].chunk_index` | integer | Position of this chunk within the document |
-| `results[].total_chunks` | integer | Total chunks for this document |
-| `results[].relevance_score` | float | 0.0–1.0 relevance score |
-| `results[].metadata` | object | File-type-specific metadata (sheet name, cell range for Excel; page number for PDF, etc.) |
-| `results[].metadata.dlp_labels` | string[] | DLP sensitivity labels if present |
-| `total_matches` | integer | Total matching chunks before `max_results` cap |
-| `query_id` | string | Correlation ID for RAG-side audit logging |
-| `truncated` | boolean | Whether results were capped |
+### Error Handling in `extensions/rag-internal/src/client.ts`
 
-### Error Responses
+```typescript
+// Pseudocode for the RAG client — implement in client.ts
+import { fetchWithSsrFGuard } from "../../../../src/infra/net/fetch-guard.js";
+import type { SsrFPolicy } from "../../../../src/infra/net/ssrf.js";
+import type { RagSearchRequest, RagSearchResponse } from "./types.js";
 
-| HTTP Status | Meaning | OpenClaw Handling |
-|-------------|---------|-------------------|
-| 401 | Delegated token expired or invalid | Re-acquire token via OBO flow; if still fails, surface "Session expired, please re-authenticate" to user |
-| 403 | User lacks access to all matched documents | Return "I couldn't find any documents you have access to for this query" |
-| 429 | Rate limited | Retry with exponential backoff (2s, 4s, 8s); max 3 retries |
-| 500 | RAG service error | Return "I'm having trouble searching documents right now. Please try again." Log `query_id` for debugging. |
+const RAG_SSRF_POLICY: SsrFPolicy = {
+  allowPrivateNetwork: false,
+  hostnameAllowlist: [process.env.RAG_ENDPOINT_HOST!],
+};
+
+export async function searchRag(
+  request: RagSearchRequest,
+  delegatedToken: string,
+): Promise<RagSearchResponse> {
+  const { response, release } = await fetchWithSsrFGuard({
+    url: process.env.RAG_ENDPOINT_URL!,
+    policy: RAG_SSRF_POLICY,
+    init: {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${delegatedToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(request),
+    },
+    timeoutMs: 10_000,
+  });
+
+  try {
+    if (response.status === 401) { /* re-acquire token, retry once */ }
+    if (response.status === 429) { /* exponential backoff, max 3 retries */ }
+    if (!response.ok) { /* log error, throw with user-friendly message */ }
+    return await response.json() as RagSearchResponse;
+  } finally {
+    await release();
+  }
+}
+```
 
 ---
 
 ## B) Model Completion Endpoint
 
-The internal Azure OpenAI endpoint provides LLM completions. OpenClaw's provider system routes here via `models.providers.azure-internal.baseUrl`.
+**No new code needed.** OpenClaw's existing provider system handles this natively.
 
-### Contract
+The model call flows through:
+1. `src/agents/pi-embedded-runner/run.ts` → `resolveModel()`
+2. `src/agents/pi-embedded-runner/model.ts` → `ModelRegistry.find()`
+3. `@mariozechner/pi-ai` → `streamSimple()` → HTTP to `model.baseUrl`
 
-| Field | Value |
-|-------|-------|
-| **Protocol** | HTTPS (internal TLS) |
-| **Method** | `POST` |
-| **Path** | `/openai/deployments/<deployment-name>/chat/completions?api-version=2024-10-21` |
-| **Authentication** | `api-key` header or `Authorization: Bearer <managed_identity_token>` |
-| **Content-Type** | `application/json` |
-| **Streaming** | `"stream": true` for real-time token delivery |
-| **Timeout** | 60s (OpenClaw-side) |
+The config in doc 02 sets `api: "openai-completions"` which selects the correct wire format for Azure OpenAI. The `apiKey` is read from `authStorage` (populated from env var via config).
 
-### Request
+### Azure-Specific Notes
 
-```json
-{
-  "messages": [
-    {
-      "role": "system",
-      "content": "You are a financial analyst assistant. You answer questions using ONLY the provided context from internal documents. Always cite your sources using [DocTitle](URL) format. If the context does not contain enough information, say so explicitly. Never fabricate data or figures."
-    },
-    {
-      "role": "user",
-      "content": "Based on the following documents:\n\n[1] Q3 2025 Variance Analysis.xlsx (COGS Detail, A1:F45):\nCOGS increased 12% vs budget driven by raw material price escalation in copper (+18% YoY)...\n\n---\n\nUser question: What drove the Q3 COGS variance?"
-    }
-  ],
-  "max_tokens": 2048,
-  "temperature": 0.2,
-  "stream": true
-}
-```
-
-### Response (Streaming SSE)
+Azure OpenAI appends `?api-version=2024-10-21` to the URL path. Verify that `pi-ai`'s `streamSimple()` handles this, or include it in the `baseUrl`:
 
 ```
-data: {"choices":[{"delta":{"role":"assistant","content":""},"index":0}]}
-
-data: {"choices":[{"delta":{"content":"The Q3 COGS variance"},"index":0}]}
-
-data: {"choices":[{"delta":{"content":" was primarily driven by..."},"index":0}]}
-
-...
-
-data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"usage":{"prompt_tokens":1200,"completion_tokens":350,"total_tokens":1550}}
-
-data: [DONE]
+baseUrl: "https://<host>/openai/deployments/<deployment>/chat/completions?api-version=2024-10-21"
 ```
 
-OpenClaw's existing provider system (`openai-completions` API type) already handles this SSE streaming format natively.
+If `pi-ai` constructs the `/chat/completions` path itself, set:
+```
+baseUrl: "https://<host>/openai/deployments/<deployment>/"
+```
 
-### Error Responses
-
-| HTTP Status | Meaning | OpenClaw Handling |
-|-------------|---------|-------------------|
-| 401 | API key invalid or managed identity token expired | Log error; surface "Service configuration error" to user; alert ops |
-| 429 | Token rate limit or request rate limit | Retry with backoff; surface "I'm temporarily busy" if all retries fail |
-| 400 | Invalid request (token overflow, etc.) | Truncate context and retry; if still fails, surface "Your question requires too much context" |
-| 500/503 | Azure endpoint error | Retry 2x; surface "Service temporarily unavailable" |
+**Test both patterns** during integration to determine which is correct.
 
 ---
 
-## C) Excel Helper Endpoints (Optional — Evaluate for MVP)
+## C) Excel Helper Endpoints
 
-These are convenience endpoints that could be implemented as thin wrappers around the model endpoint, or as dedicated microservices. **For MVP, we recommend implementing these as skills that compose RAG + model calls rather than separate endpoints.**
-
-### C1. Formula Explain
-
-**Implemented as:** Skill (`excel-formula-explain`) — no separate endpoint needed. The skill constructs a prompt with the formula and sends it to the model endpoint.
-
-### C2. Table Transform
-
-**Implemented as:** Skill (`excel-table-transform`) — takes a description of the desired transformation, retrieves the relevant table via RAG, and asks the model to produce the transformed output.
-
-### C3. Variance Narrative
-
-**Implemented as:** Skill (`excel-variance-analysis`) — retrieves budget vs. actual data via RAG, sends to model with narrative generation prompt.
-
-**Recommendation:** No separate "Excel helper" endpoints for MVP. Skills compose the existing RAG + model interfaces. This avoids deploying additional services and keeps the architecture simple.
+**Not needed.** All Excel workflows are implemented as skills that compose `rag_search` tool calls + model calls. No separate endpoints or services required. See doc 05 for skill definitions.
 
 ---
 
-## Interface Summary
+## Implementation Checklist for `extensions/rag-internal/`
 
-```
-┌─────────────┐     ┌──────────────────┐     ┌───────────────────┐
-│   Teams      │────▶│   OpenClaw        │────▶│ Internal RAG      │
-│   (User)     │     │   Gateway + Agent  │     │ POST /api/v1/search│
-└─────────────┘     │                    │     └───────────────────┘
-                    │                    │
-                    │                    │────▶┌───────────────────┐
-                    │                    │     │ Azure OpenAI      │
-                    │                    │     │ POST /openai/...  │
-                    └──────────────────┘     │ /chat/completions │
-                                              └───────────────────┘
-```
-
-Only two external (to OpenClaw) service dependencies. Both internal to our network.
+| File | Contents | Status |
+|------|----------|--------|
+| `openclaw.plugin.json` | `{ "id": "rag-internal", "configSchema": { "type": "object", "properties": {} } }` | Create |
+| `package.json` | Extension metadata + deps | Create |
+| `index.ts` | `register(api)` → `api.registerService(ragService)` | Create |
+| `src/types.ts` | `RagSearchRequest`, `RagSearchResponse`, `RagChunk`, `RagChunkMetadata` (types above) | Create |
+| `src/client.ts` | `searchRag()` function using `fetchWithSsrFGuard()` (pseudocode above) | Create |
+| `src/auth.ts` | OBO token exchange (see doc 04) | Create |
+| `src/prompt.ts` | Extra system prompt text (see doc 07) | Create |
+| `src/tool.ts` | Custom tool definition for `rag_search` — schema, handler, response formatting | Create |

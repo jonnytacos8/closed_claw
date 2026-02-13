@@ -1,5 +1,9 @@
 # 11 — Rollout and Guardrails
 
+## Implementation Note
+
+The "external upload discouraged" messaging is implemented as a system prompt instruction in `extensions/rag-internal/src/prompt.ts` (see doc 07), not as a hardcoded filter. Rate limiting and conversation length limits are handled by existing OpenClaw session management in `src/sessions/`. The `allowFrom` list in `channels.msteams` config controls pilot user access.
+
 ## MVP Rollout Plan
 
 ### Phase 0: Pre-Pilot Setup (Week 0)

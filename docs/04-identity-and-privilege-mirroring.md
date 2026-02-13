@@ -1,8 +1,10 @@
 # 04 — Identity and Privilege Mirroring
 
-## Overview
+## Implementation Target
 
-Every request from a user in Teams must carry that user's identity all the way through to the RAG service, so that SharePoint security trimming is enforced. The user must never see, summarize, or receive answers based on documents they cannot access in SharePoint.
+**File to create:** `extensions/rag-internal/src/auth.ts`
+
+This module acquires delegated user tokens via the On-Behalf-Of (OBO) flow and caches them per-user per-session.
 
 ## Identity Flow
 
@@ -11,122 +13,186 @@ sequenceDiagram
     participant U as User (Teams)
     participant BF as Bot Framework
     participant OC as OpenClaw (msteams ext)
+    participant AUTH as auth.ts (NEW)
     participant AAD as Azure AD / Entra ID
     participant RAG as Internal RAG Service
-    participant AZ as Azure OpenAI
 
-    U->>BF: Send message (SSO token in Activity)
+    U->>BF: Message (SSO token in Activity)
     BF->>OC: POST /api/messages (Activity + token)
-    OC->>OC: Extract user identity from Activity<br/>(aadObjectId, upn, tenantId)
-    OC->>AAD: On-Behalf-Of token exchange<br/>(bot token → delegated user token<br/>scoped to RAG service)
-    AAD-->>OC: Delegated user token<br/>(audience: RAG service)
-    OC->>RAG: POST /api/v1/search<br/>Authorization: Bearer <delegated_token><br/>user_context.upn: jane.doe@contoso.com
-    RAG->>RAG: Validate token<br/>Extract user identity<br/>Apply SharePoint ACL filter
+    OC->>OC: Extract identity from Activity
+    OC->>AUTH: getOrAcquireDelegatedToken(ssoToken, userId)
+    AUTH->>AUTH: Check cache: token for userId still valid?
+    alt Cache hit (token valid for >5 min)
+        AUTH-->>OC: Cached delegated token
+    else Cache miss or near-expiry
+        AUTH->>AAD: POST /oauth2/v2.0/token (OBO flow)
+        AAD-->>AUTH: Delegated token (audience: RAG service)
+        AUTH->>AUTH: Cache token with TTL
+        AUTH-->>OC: Fresh delegated token
+    end
+    OC->>RAG: POST /api/v1/search + Bearer delegated_token
+    RAG->>RAG: Validate token → extract user → apply SharePoint ACLs
     RAG-->>OC: Security-trimmed results
-    OC->>AZ: POST /chat/completions<br/>(API key auth — no user token needed,<br/>model endpoint does not access user data)
-    AZ-->>OC: Completion
-    OC->>BF: Reply to user
-    BF->>U: Display response in Teams
 ```
 
-## How User Identity Travels
+## Step 1: Teams Activity → User Identity
 
-### Step 1: Teams → OpenClaw
+**Already implemented in:** `extensions/msteams/src/inbound.ts` and `extensions/msteams/src/monitor-handler/message-handler.ts`
 
-The `msteams` extension receives a Bot Framework `Activity` payload. Key identity fields:
+Identity fields available from the Bot Framework Activity:
 
-| Activity Field | Maps To | Purpose |
-|----------------|---------|---------|
-| `from.aadObjectId` | Azure AD Object ID | Unique, immutable user identifier |
-| `from.name` | Display name | Logging only (not used for auth) |
-| `channelData.tenant.id` | Tenant ID | Multi-tenant validation |
-| SSO token (via `tokenExchange`) | Azure AD access token | Delegated auth for downstream services |
+| Activity Field | Usage | Available Today? |
+|----------------|-------|-----------------|
+| `from.id` | Teams user ID | Yes — extracted in `message-handler.ts` |
+| `from.name` | Display name | Yes — used in logging |
+| `from.aadObjectId` | Azure AD Object ID | Yes — if populated by Bot Framework |
+| `channelData.tenant.id` | Tenant ID | Yes |
+| SSO token | Via `tokenExchange` invoke or OAuth card | **Must implement** — see below |
 
-OpenClaw's `msteams` extension already extracts these fields during inbound message normalization (see `extensions/msteams/src/inbound.ts`). The MVP adds: storing the SSO token (or acquiring one via OBO) in the session context for downstream calls.
+**What a coding agent must add:** The msteams extension must handle the `tokenExchange` invoke to acquire the user's SSO token. This may require adding a handler in the monitor-handler directory, or using the Bot Framework SDK's built-in SSO support.
 
-### Step 2: OpenClaw → RAG Service (Delegated Auth)
+## Step 2: OBO Token Exchange (`extensions/rag-internal/src/auth.ts`)
 
-OpenClaw exchanges the bot's token for a delegated user token using the **On-Behalf-Of (OBO)** flow:
+### Implementation Specification
 
-1. OpenClaw presents the user's SSO token to Azure AD.
-2. Azure AD issues a new token with `audience` set to the RAG service's app registration.
-3. This delegated token carries the user's identity and permissions.
-4. OpenClaw sends this token in the `Authorization` header of RAG requests.
+```typescript
+// extensions/rag-internal/src/auth.ts
 
-**Token caching:** Delegated tokens are cached per-user per-session with a TTL slightly shorter than the token's `exp` claim. Token refresh happens transparently before expiry.
+import { createSubsystemLogger } from "openclaw/plugin-sdk";
 
-### Step 3: RAG Service Enforces Security Trimming
+const logger = createSubsystemLogger("rag-internal:auth");
 
-The RAG service is responsible for:
+type CachedToken = {
+  token: string;
+  expiresAt: number;      // ms since epoch
+  acquiredAt: number;
+};
 
-1. **Validating the delegated token** — checking signature, audience, issuer, and expiry.
-2. **Extracting user identity** — `oid` (object ID) and `upn` (user principal name) from token claims.
-3. **Applying SharePoint ACLs** — only returning chunks from documents the user has at least Read access to in SharePoint.
-4. **Supplemental UPN check** — the `user_context.upn` field in the request body serves as a cross-check against the token's `upn` claim. If they don't match, the request is rejected.
+// In-memory cache: userId → CachedToken
+const tokenCache = new Map<string, CachedToken>();
 
-### Step 4: OpenClaw → Azure Model Endpoint
+// Environment variables (resolved from .env)
+const AAD_CLIENT_ID = process.env.AAD_CLIENT_ID!;
+const AAD_CLIENT_SECRET = process.env.AAD_CLIENT_SECRET!;
+const AAD_TENANT_ID = process.env.AAD_TENANT_ID!;
+const RAG_SERVICE_SCOPE = process.env.RAG_SERVICE_SCOPE!; // e.g., "api://<rag-app-id>/.default"
+const TOKEN_URL = `https://login.microsoftonline.com/${AAD_TENANT_ID}/oauth2/v2.0/token`;
 
-The model endpoint does **not** receive user identity tokens. It authenticates OpenClaw as a service (via API key or managed identity). User data that reaches the model is limited to:
-- The assembled prompt (system instructions + RAG chunks + user question)
-- No raw files, no user tokens, no SharePoint URLs in the prompt itself (citations are added post-completion)
+export async function getDelegatedToken(
+  userSsoToken: string,
+  userId: string,
+): Promise<string> {
+  // 1. Check cache
+  const cached = tokenCache.get(userId);
+  if (cached && cached.expiresAt - Date.now() > 5 * 60 * 1000) {
+    return cached.token;
+  }
 
-## The Security Trimming Guarantee
+  // 2. OBO token exchange
+  const body = new URLSearchParams({
+    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    client_id: AAD_CLIENT_ID,
+    client_secret: AAD_CLIENT_SECRET,
+    assertion: userSsoToken,
+    scope: RAG_SERVICE_SCOPE,
+    requested_token_use: "on_behalf_of",
+  });
 
-### Contract with the RAG Service
+  const response = await fetch(TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
 
-OpenClaw **delegates** security trimming entirely to the RAG service. The contract:
+  if (!response.ok) {
+    const error = await response.text();
+    logger.error("OBO token exchange failed", { userId, status: response.status });
+    throw new OboTokenError(response.status, error);
+  }
 
-| Guarantee | Owner | Verification |
-|-----------|-------|-------------|
-| Delegated token accurately represents the requesting user | OpenClaw (via OBO flow) | Token claims match Teams Activity identity |
-| RAG results only include documents the user can access in SharePoint | RAG service | RAG service checks SharePoint permissions via Microsoft Graph or cached ACL index |
-| No document content is returned for items the user lacks Read access to | RAG service | Integration test: query as User A for doc only User B can access → 0 results |
-| Token validation rejects expired, malformed, or wrong-audience tokens | RAG service | Standard Azure AD token validation middleware |
+  const data = await response.json();
+  const token = data.access_token;
+  const expiresIn = data.expires_in; // seconds
 
-### What OpenClaw Does NOT Do
+  // 3. Cache
+  tokenCache.set(userId, {
+    token,
+    expiresAt: Date.now() + expiresIn * 1000,
+    acquiredAt: Date.now(),
+  });
 
-- OpenClaw does **not** independently verify SharePoint permissions.
-- OpenClaw does **not** filter RAG results after receiving them.
-- OpenClaw **trusts** the RAG service to enforce security trimming correctly.
-- OpenClaw **does** verify that the token exchange succeeded and that the delegated token's `upn` matches the session user.
+  return token;
+}
 
-## Failure Modes and User-Facing Messages
+export function clearTokenCache(userId: string): void {
+  tokenCache.delete(userId);
+}
 
-| Failure | Detection | User Message | Internal Action |
-|---------|-----------|-------------|-----------------|
-| SSO token not available in Teams Activity | `tokenExchange` returns null or error | "I need to verify your identity. Please try sending your message again. If this persists, sign out and back into Teams." | Log `auth_failure:sso_unavailable` with `hashed_user_id` |
-| OBO token exchange fails | Azure AD returns error (e.g., consent not granted) | "I'm unable to verify your access permissions. Please contact your admin — they may need to approve this app." | Log `auth_failure:obo_exchange` with error code |
-| Delegated token expired mid-session | RAG returns 401 | "Your session has expired. Please send your question again to re-authenticate." | Clear cached token; next request triggers fresh OBO flow |
-| UPN mismatch (token vs. request) | RAG returns 403 with `upn_mismatch` error | "There was an identity verification error. Please try again." | Log `auth_failure:upn_mismatch` as security event; alert ops |
-| User has no access to any matching documents | RAG returns 200 with empty results | "I searched for relevant documents but didn't find any you have access to. You may need to request access to the relevant SharePoint library." | Log `rag_empty:no_access` — distinguish from "no results found" |
-| RAG service unavailable | RAG returns 500/503 or timeout | "I'm having trouble accessing documents right now. Please try again in a moment." | Log `rag_error:service_unavailable`; retry 2x with backoff |
-
-## Session Identity Cache
-
-To avoid repeated OBO token exchanges for every RAG call within a conversation:
-
+export class OboTokenError extends Error {
+  constructor(public status: number, public detail: string) {
+    super(`OBO token exchange failed: ${status}`);
+    this.name = "OboTokenError";
+  }
+}
 ```
-Session Store (per user, per conversation):
-  - aad_object_id: string        (from Teams Activity)
-  - upn: string                  (from Teams Activity)
-  - delegated_token: string      (from OBO exchange)
-  - token_expiry: timestamp      (from token exp claim)
-  - last_validated: timestamp    (last successful RAG call)
+
+### Dependencies
+
+- `fetch` — Node 22 built-in (no additional package needed)
+- `login.microsoftonline.com` must be in the SSRF allowlist and container egress allowlist
+
+### Alternative: Use MSAL
+
+If the team prefers using the official Microsoft library:
+
+```bash
+npm install @azure/msal-node
 ```
 
-Token is refreshed when `token_expiry - now < 5 minutes`. Session is invalidated if the Teams Activity's `aadObjectId` changes (should never happen within a conversation, but defensive check).
+Use `ConfidentialClientApplication.acquireTokenOnBehalfOf()` instead of raw HTTP. This handles token caching, retry, and error parsing. The implementation above avoids the dependency for simplicity.
 
-## Audit Requirements
+## Step 3: Connecting Auth to the RAG Client
 
-Every RAG call must be logged with:
+In `extensions/rag-internal/src/tool.ts`, the `rag_search` tool handler:
 
-| Field | Purpose |
-|-------|---------|
-| `trace_id` | Correlation across the full request lifecycle |
-| `hashed_user_id` | SHA-256 of `aadObjectId` — for usage analytics without storing PII in logs |
-| `upn_hash` | SHA-256 of UPN — for cross-referencing with RAG audit logs |
-| `rag_query_id` | Returned by RAG service — for RAG-side audit trail |
-| `documents_returned` | Count of chunks returned |
-| `document_ids` | List of `document_id` values (SharePoint item IDs, not content) |
-| `auth_method` | `obo_delegated` or `fallback` |
-| `token_age_seconds` | How old the cached delegated token was at time of use |
+1. Extracts the user's SSO token from the session/context (passed from msteams extension).
+2. Calls `getDelegatedToken(ssoToken, userId)` from `auth.ts`.
+3. Passes the delegated token to `searchRag(request, delegatedToken)` from `client.ts`.
+4. If `searchRag()` returns 401, calls `clearTokenCache(userId)` and retries once.
+
+## Security Trimming Guarantee
+
+| Guarantee | Owner | Implementation |
+|-----------|-------|---------------|
+| Delegated token represents the requesting user | `auth.ts` (OBO flow) | Token's `oid` + `upn` claims match the Teams Activity identity |
+| RAG results respect SharePoint ACLs | RAG service | RAG validates token and filters results by user permissions |
+| Expired/invalid tokens are rejected | RAG service | Standard Azure AD token validation |
+| UPN in request body matches token UPN | RAG service | Cross-check `user_context.upn` against token claim |
+
+**OpenClaw does NOT independently verify SharePoint permissions.** It delegates entirely to the RAG service via the delegated token.
+
+## Failure Modes
+
+| Failure | Detection Point | User Message | Code Action |
+|---------|----------------|-------------|-------------|
+| SSO token unavailable | `tokenExchange` handler in msteams extension | "I need to verify your identity. Please try again." | Log `auth_failure:sso_unavailable` |
+| OBO exchange fails | `auth.ts` → `OboTokenError` | "I'm unable to verify your access. Please contact your admin." | Log `auth_failure:obo_exchange` with status code |
+| Token expired mid-session | `client.ts` gets 401 from RAG | "Your session expired. Please send your question again." | `clearTokenCache(userId)` + retry once |
+| UPN mismatch | RAG returns 403 | "Identity verification error. Please try again." | Log as **security event** + alert |
+| No accessible documents | RAG returns 200 + empty results | "I didn't find documents you have access to for this query." | Log `rag_empty:no_access` |
+
+## Audit Fields (Emitted by `rag_search` Tool)
+
+Every RAG call logs (via `createSubsystemLogger("rag-internal")`):
+
+```typescript
+logger.info("rag_search", {
+  trace_id,
+  hashed_user_id: sha256(aadObjectId),
+  rag_query_id: response.query_id,
+  document_ids: response.results.map(r => r.document_id),
+  chunk_count: response.results.length,
+  auth_method: "obo_delegated",
+  token_age_seconds: Math.floor((Date.now() - cachedToken.acquiredAt) / 1000),
+});
+```

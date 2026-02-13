@@ -1,63 +1,150 @@
 # 01 — Scope and Non-Goals
 
-## MVP Scope (What We Will Ship)
+## MVP Scope — Concrete Deliverables for a Coding Agent
 
-### Core Infrastructure
-- **Azure-only model routing.** Configure `models.providers` with a single provider pointing `baseUrl` at our internal Azure OpenAI endpoint. Remove or disable all other provider configurations. Auth via `api-key` or `oauth` against the Azure endpoint.
-- **Internal RAG integration.** Replace or supplement OpenClaw's built-in memory search with calls to our internal RAG service that indexes SharePoint. Pass user identity tokens for security-trimmed results.
-- **Egress lockdown.** Configure network policy so OpenClaw can only reach: (a) the internal Azure model endpoint, (b) the internal RAG endpoint, (c) Teams Bot Framework webhook endpoints. All other outbound traffic is blocked at the container/network level.
-- **Teams as primary interface.** Use the existing `msteams` extension (`extensions/msteams/`) with Bot Framework auth. Users interact via Teams DMs or a dedicated channel.
+### Deliverable 1: Azure-Only Model Routing (Config Only — No Code)
 
-### Skills (MVP Allowlist)
-- **5–8 allowlisted skills** focused on Excel/finance workflows. No external-facing skills (no `browser`, no `github`, no `discord`, etc.).
-- Skills limited to: Excel formula explanation, table summarization, variance analysis, GL line mapping, commentary generation, document Q&A, citation formatting.
-- All skills restricted to internal-only egress.
+Set `models.mode: "replace"` in `openclaw.json`. This field is defined in `src/config/zod-schema.ts` → `ModelsConfigSchema`. When set to `"replace"`, `resolveImplicitProviders()` in `src/agents/models-config.providers.ts` skips ALL implicit provider discovery — no Anthropic, no OpenAI public, no Gemini, no Ollama, no Copilot, no Bedrock. Only the explicitly declared `azure-internal` provider is available.
 
-### Identity & Privilege
-- **User identity passthrough.** Teams SSO token → OpenClaw session → delegated token to RAG service and model endpoint.
-- **Security trimming validation.** Document and test the contract: user cannot retrieve RAG results for documents they cannot access in SharePoint.
+```jsonc
+{
+  "models": {
+    "mode": "replace",
+    "providers": {
+      "azure-internal": {
+        "baseUrl": "${AZURE_OPENAI_BASE_URL}",  // Resolved by src/config/env-substitution.ts
+        "apiKey": "${AZURE_OPENAI_API_KEY}",
+        "api": "openai-completions",             // Wire format — matches Azure OpenAI API
+        "models": [{
+          "id": "${AZURE_DEPLOYMENT_MODEL_ID}",
+          "name": "Internal GPT-4",
+          "contextWindow": 128000,
+          "maxTokens": 4096,
+          "input": ["text"],
+          "compat": { "maxTokensField": "max_tokens" }
+        }]
+      }
+    }
+  }
+}
+```
 
-### Observability
-- **Structured trace logging.** `trace_id`, `hashed_user_id`, skill invoked, document IDs retrieved, latency, token usage.
-- **Minimal dashboard.** Request volume, latency percentiles, error rates, top skills used.
+**Validation:** After config is loaded, `discoverModels()` in `src/agents/pi-model-discovery.ts` → `ModelRegistry` should contain exactly one provider. Any call to another provider name fails with "model not found."
 
-### Rollout
-- **Pilot group of 20–30 users.** Finance/ops team members who currently use external LLMs for Excel work.
-- **Training materials.** One-page quick-start guide, 3–5 example prompts for common workflows.
+### Deliverable 2: Internal RAG Extension (New Code Required)
+
+**Create:** `extensions/rag-internal/` — a new OpenClaw extension.
+
+| File to Create | Purpose | Pattern to Follow |
+|----------------|---------|------------------|
+| `extensions/rag-internal/openclaw.plugin.json` | Plugin manifest with `"id": "rag-internal"` | `extensions/diagnostics-otel/openclaw.plugin.json` |
+| `extensions/rag-internal/index.ts` | Entry — `register(api: OpenClawPluginApi)` registers service | `extensions/diagnostics-otel/index.ts` |
+| `extensions/rag-internal/src/client.ts` | HTTP client — `POST /api/v1/search` via `fetchWithSsrFGuard()` | `src/infra/net/fetch-guard.ts` |
+| `extensions/rag-internal/src/auth.ts` | OBO token exchange + cache | See doc 04 |
+| `extensions/rag-internal/src/types.ts` | TypeScript types for RAG req/res | See doc 06 |
+| `extensions/rag-internal/src/prompt.ts` | Extra system prompt (citations, guardrails) | See doc 07 |
+| `extensions/rag-internal/package.json` | Extension deps (`undici`, etc.) | Any existing extension |
+
+The extension registers a custom tool `rag_search` that skills can invoke. When called, it:
+1. Acquires a delegated user token via OBO (`auth.ts`)
+2. Calls the internal RAG endpoint via `fetchWithSsrFGuard()` with `hostnameAllowlist` enforcement (`client.ts`)
+3. Returns typed chunks with citations (`types.ts`)
+
+See **doc 03** for the RAG API contract, **doc 04** for the auth flow, **doc 06** for response handling.
+
+### Deliverable 3: 7 MVP Skills (New SKILL.md Files)
+
+**Create:** 7 `SKILL.md` files under a directory loaded by `skills.load.extraDirs`.
+
+**Config:**
+```jsonc
+{
+  "skills": {
+    "allowBundled": [],                           // Empty array → ALL 52 bundled skills blocked
+                                                  // Checked by isBundledSkillAllowed() in
+                                                  // src/agents/skills/config.ts
+    "load": {
+      "extraDirs": ["/opt/openclaw/mvp-skills/"]  // Scanned by loadSkillsFromDir() in
+                                                  // src/agents/skills/workspace.ts
+    }
+  }
+}
+```
+
+**SKILL.md frontmatter format** (derived from `skills/oracle/SKILL.md` and `skills/slack/SKILL.md`):
+```yaml
+---
+name: <skill-name>
+description: <one-line description>
+metadata: { "openclaw": { "emoji": "...", "requires": { } } }
+---
+```
+
+See **doc 05** for the exact 7 skills, their names, descriptions, and full Markdown content.
+
+### Deliverable 4: Tool Policy Lockdown (Config Only)
+
+```jsonc
+{
+  "tools": {
+    "sandbox": {
+      "tools": {
+        "allow": ["rag_search"],
+        "deny": ["exec", "process", "browser", "canvas", "nodes", "cron", "gateway"]
+      }
+    }
+  }
+}
+```
+
+**How it works:** `isToolAllowed()` in `src/agents/sandbox/tool-policy.ts` — deny checked first (supports `*` wildcards), then allow. Default constants in `src/agents/sandbox/constants.ts` include `DEFAULT_TOOL_ALLOW` and `DEFAULT_TOOL_DENY` — our config overrides both.
+
+### Deliverable 5: Teams Channel Config (Config Only)
+
+```jsonc
+{
+  "channels": {
+    "msteams": {
+      "enabled": true,
+      "appId": "${MSTEAMS_APP_ID}",              // Falls back to env var per
+      "appPassword": "${MSTEAMS_APP_PASSWORD}",   // extensions/msteams/src/token.ts
+      "tenantId": "${MSTEAMS_TENANT_ID}",         // resolveMSTeamsCredentials()
+      "dmPolicy": "allowlist",                    // DmPolicy type in src/config/types.msteams.ts
+      "allowFrom": [],                            // AAD object IDs of pilot users
+      "groupPolicy": "disabled",                  // GroupPolicy type
+      "webhook": { "port": 3978 }
+    }
+  }
+}
+```
+
+### Deliverable 6: Observability (Modify Existing or Add to New Extension)
+
+Emit structured trace events via `emitDiagnosticEvent()` and/or `createSubsystemLogger()` (both exported from `src/plugin-sdk/index.ts`). If `diagnostics-otel` is enabled, events auto-export to OTLP. Otherwise, write to JSON log files.
+
+See **doc 10** for trace event schema.
+
+### Deliverable 7: Container Deployment Config
+
+Modify existing `docker-compose.yml` or create an override:
+- Mount `openclaw.json` to container
+- Mount MVP skills directory
+- Set env vars from `.env`
+- Network egress restrictions (only Azure endpoint, RAG endpoint, `login.microsoftonline.com`, Bot Framework IPs)
 
 ---
 
-## Non-Goals (What We Will NOT Do in MVP)
+## Non-Goals — What NOT to Build
 
-| Non-Goal | Rationale |
-|----------|-----------|
-| Excel add-in or direct spreadsheet integration | High engineering cost; Teams interface is sufficient for MVP validation. Evaluate for Phase 2. |
-| File upload processing in OpenClaw | MVP relies on SharePoint-indexed files via RAG. Users do not upload files directly to the bot. |
-| Multi-model failover or model selection | Single Azure endpoint. No fallback chains, no model switching UI. |
-| Custom skill development by end users | MVP ships a fixed allowlist. Skill authoring is a post-MVP capability. |
-| Voice or media processing | No ElevenLabs TTS, no image generation, no video frame extraction. Text-only. |
-| Multi-agent routing | Single agent instance. No per-team or per-department agent isolation. |
-| Web browsing or internet search | `browser` skill and web fetch are disabled. All knowledge comes from RAG over SharePoint. |
-| Mobile or desktop native apps | No macOS/iOS/Android app deployment. Teams-only for MVP. |
-| Slack, Discord, WhatsApp, or other channel support | Teams is the sole channel. Other extensions are disabled. |
-| DLP label enforcement in responses | We log DLP label metadata if present in RAG results, but do not block responses based on labels in MVP. Evaluate for Phase 2. |
-| Fine-tuning or prompt optimization at scale | System prompts are manually curated. No automated prompt tuning pipeline. |
-| Internationalization | English only for MVP. Existing i18n framework (ja-JP, zh-CN) is not exercised. |
-| Canvas / A2UI rendering | The visual workspace is not exposed in MVP. Text responses only. |
-
----
-
-## Scope Boundary Diagram
-
-```
-IN SCOPE                          OUT OF SCOPE
-─────────────────────────────     ─────────────────────────────
-Teams bot interface               Excel add-in
-Azure model endpoint              Public LLM APIs
-Internal RAG (SharePoint)         Direct file uploads
-Security-trimmed results          DLP-based response blocking
-5-8 allowlisted skills            User-authored skills
-Structured trace logging          Full APM / distributed tracing
-Pilot rollout (20-30 users)       Org-wide deployment
-Docker container deployment       Kubernetes / auto-scaling
-```
+| Non-Goal | Codebase Implication |
+|----------|---------------------|
+| Excel add-in (Office.js) | Do not create any Office.js code. Phase 2. |
+| File upload skill | Do not add upload/file-processing skill to allowlist |
+| Multi-model failover | Do not set `agents.defaults.model.fallbacks` |
+| User-authored skills | `skills.allowBundled: []` enforces; do not create skill-install UI |
+| Voice / media / Canvas | Do not enable TTS config, image model, or canvas |
+| Channels other than Teams | Only `channels.msteams` gets `enabled: true` |
+| DLP response blocking | Log `dlp_labels` from RAG metadata only; no filtering logic |
+| Web browsing | `deny: ["browser"]` in tool policy; do not enable browser extension |
+| Multi-agent routing | Do not configure `agents.list[]` with multiple entries |
+| Built-in memory/vector search | Not used; RAG extension replaces it. Do not configure `memorySearch` |

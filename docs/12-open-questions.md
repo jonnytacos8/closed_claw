@@ -1,5 +1,11 @@
 # 12 — Open Questions
 
+## Implementation Note
+
+Items marked "Blocking for MVP" must be resolved before a coding agent can complete the corresponding deliverable. The "Proposed default" for each item tells the coding agent what to assume if no decision arrives in time. Each question references the doc and code path it affects.
+
+## Summary
+
 Decisions and details that must be confirmed before or during implementation. Each item includes context on why it matters and a proposed default if no decision is made.
 
 ---

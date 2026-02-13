@@ -1,5 +1,11 @@
 # 06 — RAG Contract
 
+## Implementation Target
+
+**File:** `extensions/rag-internal/src/client.ts` — implements the HTTP client that calls this contract.
+**Types:** `extensions/rag-internal/src/types.ts` — TypeScript types matching this contract (defined in doc 03).
+**Chunk budgeting:** `extensions/rag-internal/src/tool.ts` — the `rag_search` tool handler that processes RAG results before passing to the model.
+
 ## Overview
 
 The internal RAG service is the sole pathway for OpenClaw to access organizational documents. It indexes SharePoint, enforces security trimming, and returns text chunks with citations. This document defines the exact contract between OpenClaw and the RAG service.

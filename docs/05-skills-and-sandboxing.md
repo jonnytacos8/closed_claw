@@ -1,186 +1,327 @@
 # 05 — Skills and Sandboxing
 
-## Overview
+## Implementation Target
 
-OpenClaw's skills framework loads skills from `SKILL.md` files with YAML frontmatter (see `src/agents/skills/`). Skills are behavioral instructions that teach the agent how to use tools and compose RAG + model calls for specific tasks.
+**Files to create:** 7 `SKILL.md` files under `mvp-skills/` directory (loaded via `skills.load.extraDirs`).
 
-For the MVP, we ship a **strict allowlist** of 7 skills. All other bundled skills (52 total in the default distribution) are disabled. No user-authored skills are permitted.
+## Config (Corrected — Uses Actual Schema Field Names)
 
-## MVP Skill Allowlist
+The skill config types are defined in `src/config/types.skills.ts`:
 
-### 1. `excel-formula-explain`
+```typescript
+// From src/config/types.skills.ts (actual codebase)
+type SkillsConfig = {
+  allowBundled?: string[];      // Bundled-skill allowlist — empty array = block ALL
+  load?: {
+    extraDirs?: string[];       // Additional skill folders to scan
+    watch?: boolean;
+    watchDebounceMs?: number;
+  };
+  entries?: Record<string, SkillConfig>;
+};
+```
 
-| Field | Value |
-|-------|-------|
-| **Purpose** | Explain what an Excel formula does in plain English. Identify potential errors or edge cases. |
-| **Inputs** | Formula string (e.g., `=VLOOKUP(A2,Sheet2!$A:$D,4,FALSE)`), optional context about the workbook |
-| **Outputs** | Plain-English explanation, step-by-step breakdown, warnings about common pitfalls |
-| **Risk Level** | Low — no data access, no egress. Pure model call. |
-| **Egress** | Azure model endpoint only |
-| **RAG Required** | No |
+**IMPORTANT:** There is NO `skills.load.bundled` or `skills.load.managed` field. Bundled-skill gating uses `skills.allowBundled` (a top-level array on `SkillsConfig`).
 
-### 2. `excel-table-summarize`
-
-| Field | Value |
-|-------|-------|
-| **Purpose** | Summarize a table or dataset from a SharePoint-hosted Excel file. Identify key trends, outliers, totals. |
-| **Inputs** | Document reference (file name, library, optional sheet/range), summary focus (e.g., "top 5 expense categories") |
-| **Outputs** | Structured summary with key figures, trends, and citations to source document |
-| **Risk Level** | Medium — accesses user data via RAG. Security trimming critical. |
-| **Egress** | Internal RAG endpoint, Azure model endpoint |
-| **RAG Required** | Yes — retrieves table chunks from SharePoint-indexed Excel files |
-
-### 3. `excel-variance-analysis`
-
-| Field | Value |
-|-------|-------|
-| **Purpose** | Compare budget vs. actual figures, identify and explain material variances. |
-| **Inputs** | Reference to budget and actual data (file names or library scope), materiality threshold (e.g., ">5% or >$50K") |
-| **Outputs** | Variance table, narrative explanation of material variances, cited sources |
-| **Risk Level** | Medium — accesses financial data via RAG. |
-| **Egress** | Internal RAG endpoint, Azure model endpoint |
-| **RAG Required** | Yes |
-
-### 4. `gl-line-mapper`
-
-| Field | Value |
-|-------|-------|
-| **Purpose** | Map GL account codes to descriptions, categories, or reporting lines. Explain what a GL code represents. |
-| **Inputs** | GL code(s), optional chart-of-accounts reference |
-| **Outputs** | Account description, category, reporting line mapping, related accounts |
-| **Risk Level** | Medium — may access chart of accounts via RAG. |
-| **Egress** | Internal RAG endpoint, Azure model endpoint |
-| **RAG Required** | Yes — retrieves chart of accounts or GL mapping documents |
-
-### 5. `commentary-generator`
-
-| Field | Value |
-|-------|-------|
-| **Purpose** | Generate management commentary or narrative for financial results. Suitable for board packs, monthly close notes, or variance explanations. |
-| **Inputs** | Topic/period, data references (file names or RAG scope), tone (formal/concise), length target |
-| **Outputs** | Draft commentary paragraph(s) with cited figures and sources |
-| **Risk Level** | Medium — generates text based on financial data from RAG. |
-| **Egress** | Internal RAG endpoint, Azure model endpoint |
-| **RAG Required** | Yes |
-
-### 6. `document-qa`
-
-| Field | Value |
-|-------|-------|
-| **Purpose** | Answer questions about any SharePoint-hosted document the user has access to. General-purpose Q&A skill. |
-| **Inputs** | Natural language question, optional document/library scope |
-| **Outputs** | Answer with citations (SharePoint URLs) |
-| **Risk Level** | Medium — broad RAG access within user's permissions. |
-| **Egress** | Internal RAG endpoint, Azure model endpoint |
-| **RAG Required** | Yes |
-
-### 7. `sanity-check`
-
-| Field | Value |
-|-------|-------|
-| **Purpose** | Validate figures, cross-check totals, identify potential errors in financial data. "Does this number make sense?" |
-| **Inputs** | Figures to validate, context (what they represent), optional reference data scope |
-| **Outputs** | Validation result (plausible/suspicious/error), explanation, suggested checks |
-| **Risk Level** | Medium — may compare user-stated figures against RAG-retrieved reference data. |
-| **Egress** | Internal RAG endpoint, Azure model endpoint |
-| **RAG Required** | Optional — can validate pure logic without RAG, or cross-check against documents |
-
-## Skill Configuration
-
-Skills are gated via OpenClaw's existing tool policy system (`tools.sandbox.tools.allow` / `tools.sandbox.tools.deny`):
+### openclaw.json Skills Section
 
 ```jsonc
-// openclaw.json — MVP skill gating
 {
-  "agents": {
-    "defaults": {
-      "skills": {
-        "load": {
-          "bundled": false,        // Do NOT load bundled skills (browser, github, discord, etc.)
-          "managed": false,        // Do NOT load user-managed skills from ~/.openclaw/skills/
-          "extraDirs": [
-            "/opt/openclaw/mvp-skills/"   // Load ONLY from our curated directory
-          ]
-        }
-      }
+  "skills": {
+    "allowBundled": [],                           // Empty array → isBundledSkillAllowed() in
+                                                  // src/agents/skills/config.ts rejects ALL 52 bundled skills
+    "load": {
+      "extraDirs": ["/opt/openclaw/mvp-skills/"]  // loadSkillsFromDir() in
+                                                  // src/agents/skills/workspace.ts scans this dir
     }
   },
   "tools": {
     "sandbox": {
       "tools": {
-        "allow": [
-          "excel-formula-explain",
-          "excel-table-summarize",
-          "excel-variance-analysis",
-          "gl-line-mapper",
-          "commentary-generator",
-          "document-qa",
-          "sanity-check"
-        ],
-        "deny": ["*"]             // Deny everything not explicitly allowed
+        "allow": ["rag_search"],                  // Only the custom RAG tool
+        "deny": ["exec", "process", "browser", "canvas", "nodes", "cron", "gateway"]
       }
     }
   }
 }
 ```
 
-**Important:** The `deny: ["*"]` with explicit `allow` list ensures that even if a skill is accidentally loaded, it cannot execute unless it's on the allowlist.
+## SKILL.md File Format
 
-## Sandbox / Permission Model
+Based on existing skills (`skills/oracle/SKILL.md`, `skills/slack/SKILL.md`):
 
-### Filesystem Access
+```
+---
+name: <skill-name>
+description: <one-line description>
+metadata: { "openclaw": { "emoji": "<emoji>" } }
+---
 
-| Path | Access | Reason |
-|------|--------|--------|
-| `/opt/openclaw/mvp-skills/` | Read-only | Skill definitions (SKILL.md files) |
-| `/opt/openclaw/config/` | Read-only | openclaw.json, .env |
-| `/opt/openclaw/sessions/` | Read-write | Session state persistence |
-| `/opt/openclaw/logs/` | Write-only | Structured trace logs |
-| Everything else | Denied | No access to host filesystem, user home, or temp directories |
+# <Skill Title>
 
-### Network Egress Allowlist
+<Behavioral instructions for the agent>
+```
 
-| Destination | Purpose | Protocol |
-|-------------|---------|----------|
-| `<internal-azure-endpoint>` (specific hostname) | Model completions | HTTPS |
-| `<internal-rag-endpoint>` (specific hostname) | RAG search | HTTPS |
-| `login.microsoftonline.com` | Azure AD token exchange (OBO flow) | HTTPS |
-| `smba.trafficmanager.net` / Bot Framework endpoints | Teams message delivery | HTTPS |
-| **All other destinations** | **BLOCKED** | — |
+Skills are behavioral Markdown — they teach the agent **how** to handle a request, not executable code. The agent reads the SKILL.md when the skill is selected, then uses available tools (like `rag_search`) to fulfill the request.
 
-Enforcement layers:
-1. **Container network policy** (e.g., Kubernetes NetworkPolicy or Docker network rules) — primary enforcement.
-2. **OpenClaw SSRF guard** (`fetchWithSsrFGuard` in `src/infra/net/ssrf.ts`) — application-level backup. Private network ranges already blocked by default.
-3. **Firewall rules** — defense in depth at the network infrastructure level.
+## The 7 MVP Skills
 
-### Secrets Handling
+### 1. `mvp-skills/excel-formula-explain/SKILL.md`
 
-| Secret | Storage | Access |
-|--------|---------|--------|
-| Azure model API key | Environment variable (`AZURE_OPENAI_API_KEY`) | Read by OpenClaw provider config only |
-| Bot Framework `appPassword` | Environment variable (`MSTEAMS_APP_PASSWORD`) | Read by `msteams` extension only |
-| Azure AD client secret (for OBO) | Environment variable (`AAD_CLIENT_SECRET`) | Read by auth module only |
-| User delegated tokens | In-memory session cache | Never written to disk; TTL-based expiry |
+```markdown
+---
+name: excel-formula-explain
+description: Explain Excel formulas in plain English. Identify errors and edge cases.
+metadata: { "openclaw": { "emoji": "fx" } }
+---
 
-**No secrets in skill definitions.** Skills are plain Markdown files with behavioral instructions. They do not have access to environment variables or credentials directly — they invoke tools that the agent runtime provides, and those tools handle authentication internally.
+# Excel Formula Explain
 
-## Skill Risk Matrix
+Use this skill when the user asks you to explain an Excel formula, troubleshoot a formula error, or understand what a formula does.
 
-| Skill | Data Access | RAG | Model | Can Generate PII? | Mitigation |
-|-------|-------------|-----|-------|-------------------|------------|
-| `excel-formula-explain` | None | No | Yes | No | Low risk — stateless |
-| `excel-table-summarize` | Via RAG (user-scoped) | Yes | Yes | Yes (financial data) | Security trimming; citations required |
-| `excel-variance-analysis` | Via RAG (user-scoped) | Yes | Yes | Yes (financial data) | Security trimming; citations required |
-| `gl-line-mapper` | Via RAG (user-scoped) | Yes | Yes | Low | Security trimming |
-| `commentary-generator` | Via RAG (user-scoped) | Yes | Yes | Yes (financial data) | Security trimming; draft watermark |
-| `document-qa` | Via RAG (user-scoped) | Yes | Yes | Yes (any doc content) | Security trimming; citations required |
-| `sanity-check` | Optional RAG | Maybe | Yes | Low | Stateless validation mode is zero-risk |
+## How to Handle
 
-## Adding Skills Post-MVP
+1. Parse the formula the user provides.
+2. Break it down step by step — identify each function, its arguments, and what it returns.
+3. Explain in plain English what the overall formula computes.
+4. Flag common pitfalls (e.g., VLOOKUP exact vs. approximate match, circular references, #N/A risks).
+5. If the user provides workbook context, explain how the formula interacts with the data.
 
-New skills must go through:
+## Important
 
-1. **Security review** — egress destinations, data access patterns, risk assessment.
-2. **Allowlist update** — add to `tools.sandbox.tools.allow` in config.
-3. **Egress review** — any new external destination requires firewall rule update and architecture review.
-4. **Testing** — skill must be tested with the security trimming contract (user A cannot access user B's documents through the skill).
+- This skill does NOT require RAG. Do not call rag_search unless the user references a specific document.
+- Do NOT fabricate sample data. If you need data context to explain, ask the user.
+- Cite general Excel knowledge, not internal documents.
+```
+
+### 2. `mvp-skills/excel-table-summarize/SKILL.md`
+
+```markdown
+---
+name: excel-table-summarize
+description: Summarize tables and datasets from SharePoint-hosted Excel files. Identify trends and key figures.
+metadata: { "openclaw": { "emoji": "table" } }
+---
+
+# Excel Table Summarize
+
+Use this skill when the user asks you to summarize data from a spreadsheet, identify trends, or highlight key figures from an Excel file.
+
+## How to Handle
+
+1. Call `rag_search` with the user's query to retrieve relevant table chunks from SharePoint.
+   - If the user names a specific file, include it in the query.
+   - If the user names a library, pass it as `filters.libraries`.
+2. Review the returned chunks. Pay attention to `metadata.sheet_name` and `metadata.cell_range`.
+3. Summarize the data: key totals, trends, outliers, top/bottom items.
+4. Present summary with a Markdown table if appropriate.
+5. ALWAYS cite every figure: `[Document Title — Sheet: SheetName](document_url)`.
+
+## Important
+
+- If RAG returns no results, tell the user you couldn't find the file and suggest they check the SharePoint library name.
+- If multiple sheets are relevant, summarize each and note which sheet the data comes from.
+- Do NOT fabricate numbers. Every figure must come from a RAG chunk.
+```
+
+### 3. `mvp-skills/excel-variance-analysis/SKILL.md`
+
+```markdown
+---
+name: excel-variance-analysis
+description: Compare budget vs. actual figures. Identify and explain material variances.
+metadata: { "openclaw": { "emoji": "delta" } }
+---
+
+# Excel Variance Analysis
+
+Use this skill when the user asks about variances between budget and actual, plan vs. forecast, or any two-period comparison.
+
+## How to Handle
+
+1. Call `rag_search` to retrieve both budget/plan AND actual/forecast data.
+   - You may need two queries: one for budget data, one for actuals.
+   - Scope to the user's specified period, region, or line items.
+2. For each line item where both budget and actual are available:
+   - Calculate variance ($ and %).
+   - Flag if it exceeds any materiality threshold the user specified (default: >5% or >$50K).
+3. Present results as a Markdown table: | Line Item | Budget | Actual | Variance ($) | Variance (%) |
+4. After the table, provide a narrative explaining the material variances.
+5. Cite BOTH source documents for every figure.
+
+## Important
+
+- If you can only find one side (budget but no actuals, or vice versa), tell the user what's missing.
+- Ask the user for their materiality threshold if they haven't specified one.
+- Do NOT estimate or interpolate missing data. Report only what the documents contain.
+```
+
+### 4. `mvp-skills/gl-line-mapper/SKILL.md`
+
+```markdown
+---
+name: gl-line-mapper
+description: Map GL account codes to descriptions, categories, and reporting lines.
+metadata: { "openclaw": { "emoji": "ledger" } }
+---
+
+# GL Line Mapper
+
+Use this skill when the user asks about GL account codes, chart of accounts mappings, or reporting line classifications.
+
+## How to Handle
+
+1. Call `rag_search` with the GL code(s) the user provides.
+   - Include "chart of accounts" or "GL mapping" in the query to target reference documents.
+   - If the user mentions a specific chart of accounts document, include that in the query.
+2. For each GL code, provide:
+   - Account description
+   - Category (e.g., Revenue, COGS, OpEx, CapEx)
+   - Reporting line or financial statement line item
+   - Related accounts if visible in the mapping
+3. Present as a table if multiple codes are requested.
+4. Cite the chart of accounts document.
+
+## Important
+
+- GL mappings change over time. Always cite the specific document so the user can verify it's current.
+- If a code is not found, say so explicitly rather than guessing.
+```
+
+### 5. `mvp-skills/commentary-generator/SKILL.md`
+
+```markdown
+---
+name: commentary-generator
+description: Generate management commentary for financial results. Board packs, close notes, variance explanations.
+metadata: { "openclaw": { "emoji": "pen" } }
+---
+
+# Commentary Generator
+
+Use this skill when the user asks you to draft commentary, narrative, or explanatory text for financial results.
+
+## How to Handle
+
+1. Call `rag_search` to retrieve the relevant financial data for the period/topic.
+   - Query for the specific period (e.g., "October 2025 close"), region, or metric.
+2. Draft commentary in a professional, concise tone suitable for a board pack or monthly close report.
+3. Structure:
+   - Opening summary sentence (1-2 sentences covering the headline result).
+   - Key highlights (3-5 bullet points with the most important figures).
+   - Detailed narrative organized by topic area (revenue, costs, margins, etc.).
+4. Every figure MUST be cited with the source document and sheet/page.
+5. Use past tense for completed periods. Use present tense for current state.
+6. Format currency consistently: $X.XM or $X,XXX with 2 decimal places.
+
+## Important
+
+- This generates a DRAFT. Always note: "This is a draft for review. Please verify all figures against source documents before publishing."
+- Do NOT add opinions, recommendations, or forward-looking statements unless the user explicitly asks.
+- If key data is missing from the RAG results, note the gap rather than fabricating.
+```
+
+### 6. `mvp-skills/document-qa/SKILL.md`
+
+```markdown
+---
+name: document-qa
+description: Answer questions about SharePoint-hosted documents. General-purpose document Q&A.
+metadata: { "openclaw": { "emoji": "doc" } }
+---
+
+# Document Q&A
+
+Use this skill for general questions about any document the user has access to in SharePoint. This is the fallback skill when no more specific skill applies.
+
+## How to Handle
+
+1. Call `rag_search` with the user's question as the query.
+   - If the user mentions a specific document or library, pass it in filters.
+   - If the query is broad, start with max_results: 10 and refine if needed.
+2. Review the returned chunks for relevance.
+3. Answer the user's question based on the document content.
+4. Cite every factual claim with `[Document Title](document_url)`.
+5. If the context is insufficient, say: "I don't have enough information in the available documents to fully answer this. You may want to check [document/library] directly."
+
+## Important
+
+- Do NOT answer from general knowledge if the question is about internal documents or company-specific data.
+- If the user's question is about a general topic (not document-specific), you may use general knowledge but clearly state you are not citing internal documents.
+- Distinguish between "no relevant documents found" and "documents found but they don't answer the question."
+```
+
+### 7. `mvp-skills/sanity-check/SKILL.md`
+
+```markdown
+---
+name: sanity-check
+description: Validate figures, cross-check totals, identify potential errors in financial data.
+metadata: { "openclaw": { "emoji": "check" } }
+---
+
+# Sanity Check
+
+Use this skill when the user asks you to validate a number, cross-check a total, or verify that figures "make sense."
+
+## How to Handle
+
+1. Understand what the user wants validated: a specific figure, a total, a trend, a ratio.
+2. If the user provides the figure directly (e.g., "NA revenue is $14.2M for October"):
+   - Call `rag_search` to find historical or reference data for comparison.
+   - Compare the stated figure against the retrieved context.
+3. If the user asks you to check figures in a document:
+   - Call `rag_search` to retrieve the relevant document.
+   - Verify internal consistency (do line items sum to totals? do percentages add up?).
+4. Report your finding:
+   - "Plausible" — the figure is consistent with available reference data. Cite the reference.
+   - "Suspicious" — the figure deviates significantly from reference data. Explain why and cite sources.
+   - "Cannot verify" — insufficient reference data to validate. Suggest what data would be needed.
+
+## Important
+
+- Be explicit about your confidence level and what you're comparing against.
+- Never say a figure is "correct" — say it is "consistent with" or "plausible based on."
+- Always cite the reference data used for comparison.
+```
+
+## Skill Loading Flow (How It Works in the Codebase)
+
+```
+1. src/agents/skills/workspace.ts → loadWorkspaceSkillEntries()
+   → Scans each directory in skills.load.extraDirs
+   → For each <dir>/<name>/SKILL.md found, parses YAML frontmatter
+   → Creates SkillEntry { skill, frontmatter, metadata, invocation }
+
+2. src/agents/skills/config.ts → shouldIncludeSkill()
+   → For bundled skills: checks skills.allowBundled (our empty array rejects all)
+   → For extraDirs skills: checks metadata.requires.* conditions
+   → Our skills have no requires → all pass
+
+3. src/agents/skills/workspace.ts → buildWorkspaceSkillsPrompt()
+   → Formats skill list for the system prompt: name, description, location
+   → Agent sees: "Available skills: excel-formula-explain, excel-table-summarize, ..."
+
+4. At runtime, when the agent selects a skill:
+   → Agent reads the SKILL.md file
+   → Follows the instructions to use available tools (rag_search)
+```
+
+## Network Egress Enforcement
+
+| Layer | Mechanism | Config |
+|-------|-----------|--------|
+| Container | Docker/K8s network policy | Allow only Azure, RAG, AAD, Bot Framework hosts |
+| Application | `fetchWithSsrFGuard()` in `src/infra/net/fetch-guard.ts` | `SsrFPolicy.hostnameAllowlist` |
+| Defaults | `src/infra/net/ssrf.ts` | Blocks private IPs, localhost, metadata endpoints by default |
+
+## Secrets Handling
+
+| Secret | Env Var | Accessed By |
+|--------|---------|-------------|
+| Azure model API key | `AZURE_OPENAI_API_KEY` | Provider config (via `src/config/env-substitution.ts`) |
+| Bot Framework password | `MSTEAMS_APP_PASSWORD` | `extensions/msteams/src/token.ts` → `resolveMSTeamsCredentials()` |
+| AAD client secret | `AAD_CLIENT_SECRET` | `extensions/rag-internal/src/auth.ts` |
+| Delegated tokens | In-memory only | `auth.ts` token cache — never on disk |
+
+**Skills have NO access to secrets.** They are plain Markdown instructions. Authentication is handled by the tool implementations (client.ts, auth.ts) that the skills invoke.
