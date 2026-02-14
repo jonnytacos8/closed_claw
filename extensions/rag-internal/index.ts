@@ -1,16 +1,14 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
-import { createRagInternalService } from "./src/service.js";
-import { createRagSearchTool } from "./src/tool.js";
 
 const plugin = {
   id: "rag-internal",
-  name: "RAG Internal",
-  description: "Internal delegated-auth RAG search tool for SharePoint-grounded finance workflows",
+  name: "Internal RAG",
+  description: "Internal RAG service integration with OBO auth and rag_search tool",
   configSchema: emptyPluginConfigSchema(),
   register(api: OpenClawPluginApi) {
-    api.registerService(createRagInternalService());
-    api.registerTool(createRagSearchTool(), { name: "rag_search" });
+    // Tool registration will be added in T4
+    api.logger.info("rag-internal extension loaded");
   },
 };
 
