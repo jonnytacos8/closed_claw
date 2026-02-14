@@ -1,6 +1,8 @@
 services:
   openclaw-gateway:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
+    env_file:
+      - ./deploy/.env
     environment:
       HOME: /home/node
       TERM: xterm-256color
@@ -8,12 +10,16 @@ services:
       CLAUDE_AI_SESSION_KEY: ${CLAUDE_AI_SESSION_KEY}
       CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY}
       CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE}
+      OPENCLAW_CONFIG: /opt/openclaw/deploy/openclaw.json
     volumes:
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+      - ./deploy/openclaw.json:/opt/openclaw/deploy/openclaw.json:ro
+      - ./mvp-skills:/opt/openclaw/mvp-skills:ro
     ports:
       - "${OPENCLAW_GATEWAY_PORT:-18789}:18789"
       - "${OPENCLAW_BRIDGE_PORT:-18790}:18790"
+      - "3978:3978"
     init: true
     restart: unless-stopped
     command:
@@ -29,6 +35,8 @@ services:
 
   openclaw-cli:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
+    env_file:
+      - ./deploy/.env
     environment:
       HOME: /home/node
       TERM: xterm-256color
@@ -37,9 +45,12 @@ services:
       CLAUDE_AI_SESSION_KEY: ${CLAUDE_AI_SESSION_KEY}
       CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY}
       CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE}
+      OPENCLAW_CONFIG: /opt/openclaw/deploy/openclaw.json
     volumes:
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+      - ./deploy/openclaw.json:/opt/openclaw/deploy/openclaw.json:ro
+      - ./mvp-skills:/opt/openclaw/mvp-skills:ro
     stdin_open: true
     tty: true
     init: true

@@ -1,0 +1,51 @@
+{
+  "models": {
+    "mode": "replace",
+    "providers": {
+      "azure-internal": {
+        "baseUrl": "${AZURE_OPENAI_BASE_URL}",
+        "apiKey": "${AZURE_OPENAI_API_KEY}",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "${AZURE_DEPLOYMENT_MODEL_ID}",
+            "name": "Internal GPT-4",
+            "contextWindow": 128000,
+            "maxTokens": 4096,
+            "input": ["text"],
+            "compat": { "maxTokensField": "max_tokens" }
+          }
+        ]
+      }
+    }
+  },
+  "channels": {
+    "msteams": {
+      "enabled": true,
+      "appId": "${MSTEAMS_APP_ID}",
+      "appPassword": "${MSTEAMS_APP_PASSWORD}",
+      "tenantId": "${MSTEAMS_TENANT_ID}",
+      "dmPolicy": "allowlist",
+      "allowFrom": [],
+      "groupPolicy": "disabled",
+      "webhook": { "port": 3978 }
+    }
+  },
+  "skills": {
+    "allowBundled": [],
+    "load": { "extraDirs": ["/opt/openclaw/mvp-skills/"] }
+  },
+  "tools": {
+    "sandbox": {
+      "tools": {
+        "allow": ["rag_search"],
+        "deny": ["exec", "process", "browser", "canvas", "nodes", "cron", "gateway"]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": { "primary": "azure-internal/${AZURE_DEPLOYMENT_MODEL_ID}" }
+    }
+  }
+}
