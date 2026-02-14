@@ -1,5 +1,9 @@
 # 08 — Excel Competition Plan
 
+## Implementation Note
+
+This doc defines the 5 core workflows the MVP must support. Each workflow maps to a skill in doc 05 and composes `rag_search` (doc 03/06) + model calls (doc 07). A coding agent validates the MVP by running these 5 workflows end-to-end and confirming citations link to real SharePoint `webUrl`s.
+
 ## The Problem We're Solving
 
 Finance and ops teams currently "upload to Claude" (or ChatGPT) for Excel-centric work: pasting spreadsheet data into a public LLM to get variance explanations, commentary drafts, formula help, and sanity checks. This workflow is:

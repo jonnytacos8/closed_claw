@@ -1,5 +1,15 @@
 # 10 — Observability
 
+## Implementation Target
+
+**Logging:** Use `createSubsystemLogger("rag-internal")` from `src/logging/subsystem.ts` (exported via `src/plugin-sdk/index.ts`) for structured logging in the RAG extension.
+
+**Diagnostics:** Use `emitDiagnosticEvent()` from `src/plugin-sdk/index.ts` for metrics that the `diagnostics-otel` extension can export to OTLP. Event types include `model.usage`, `run.attempt`, etc.
+
+**OTel:** If OTLP endpoint is available, enable `extensions/diagnostics-otel/` and configure `diagnostics.otel.endpoint` in config. The extension subscribes to `onDiagnosticEvent` and records metrics like `openclaw.tokens`, `openclaw.cost.usd`, `openclaw.run.duration_ms`.
+
+**Log transport:** For custom log sinks, use `registerLogTransport(transport: LogTransport)` which returns an unsubscribe function. Transports receive `LogTransportRecord` objects.
+
 ## Overview
 
 MVP observability focuses on operational visibility, security auditing, and usage measurement — with strict boundaries on what we log to avoid storing sensitive document content or PII.

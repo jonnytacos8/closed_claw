@@ -1,5 +1,9 @@
 # 09 — Teams Interface Analysis
 
+## Implementation Note
+
+No new code from this doc — the decision is Teams DM as primary MVP interface. The Teams config is specified in doc 02 (`channels.msteams`). Key config fields from `src/config/types.msteams.ts`: `dmPolicy: "allowlist"`, `allowFrom: [...]`, `groupPolicy: "disabled"`. The msteams extension at `extensions/msteams/` is used as-is except for the SSO/OBO additions described in doc 04.
+
 ## Objective
 
 Evaluate whether Microsoft Teams is the optimal primary interface for Excel-heavy finance/ops workflows. Propose a phased interface strategy.

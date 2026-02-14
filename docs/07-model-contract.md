@@ -1,5 +1,13 @@
 # 07 — Model Contract
 
+## Implementation Target
+
+**System prompt:** Create `extensions/rag-internal/src/prompt.ts` — exports the base system prompt and skill-specific additions. Injected via the `extraSystemPrompt` parameter of `buildAgentSystemPrompt()` in `src/agents/system-prompt.ts`.
+
+**Model config:** No code changes — handled by `models.providers.azure-internal` in `openclaw.json` (doc 02). The `pi-ai` library's `streamSimple()` function constructs HTTP requests using `model.baseUrl` + `model.api`.
+
+**Chunk formatting:** Implement in `extensions/rag-internal/src/tool.ts` — the `rag_search` tool formats RAG chunks with `[1]`, `[2]` citation markers before they reach the model prompt.
+
 ## Overview
 
 All model calls route to the internal Azure OpenAI endpoint. This document defines input constraints, context budgeting, system prompt guidelines, and logging policy.
