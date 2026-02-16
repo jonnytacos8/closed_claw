@@ -1,37 +1,48 @@
-import { sleep } from "openclaw/plugin-sdk";
 import type { SsrFPolicy } from "../../../src/infra/net/ssrf.js";
 import type { RagSearchRequest, RagSearchResponse } from "./types.js";
 import { fetchWithSsrFGuard } from "../../../src/infra/net/fetch-guard.js";
+import { createSubsystemLogger } from "../../../src/logging/subsystem.js";
 
-const RETRYABLE_STATUSES = new Set([429]);
+const logger = createSubsystemLogger("rag-internal:client");
+
+// SSRF policy: only the RAG endpoint host is allowed
+const RAG_SSRF_POLICY: SsrFPolicy = {
+  allowPrivateNetwork: false,
+  hostnameAllowlist: [process.env.RAG_ENDPOINT_HOST!],
+};
+
 const RAG_TIMEOUT_MS = 10_000;
+const MAX_RETRIES_ON_429 = 3;
 
-function requireEnv(name: string): string {
-  const value = process.env[name]?.trim();
-  if (!value) {
-    throw new Error(`Missing required env var ${name}`);
+export class RagClientError extends Error {
+  constructor(
+    public status: number,
+    public userMessage: string,
+    detail?: string,
+  ) {
+    super(`RAG request failed: ${status}${detail ? ` — ${detail}` : ""}`);
+    this.name = "RagClientError";
   }
-  return value;
 }
 
-function ragSsrFPolicy(): SsrFPolicy {
-  return {
-    allowPrivateNetwork: false,
-    hostnameAllowlist: [requireEnv("RAG_ENDPOINT_HOST")],
-  };
-}
+/** @deprecated Use RagClientError */
+export const RagHttpError = RagClientError;
 
 export async function searchRag(
   request: RagSearchRequest,
   delegatedToken: string,
 ): Promise<RagSearchResponse> {
-  const url = requireEnv("RAG_ENDPOINT_URL");
-  const policy = ragSsrFPolicy();
+  let lastError: Error | undefined;
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt <= MAX_RETRIES_ON_429; attempt++) {
+    if (attempt > 0) {
+      // Exponential backoff: 1s, 2s, 4s
+      await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** (attempt - 1)));
+    }
+
     const { response, release } = await fetchWithSsrFGuard({
-      url,
-      policy,
+      url: process.env.RAG_ENDPOINT_URL!,
+      policy: RAG_SSRF_POLICY,
       init: {
         method: "POST",
         headers: {
@@ -45,15 +56,57 @@ export async function searchRag(
     });
 
     try {
-      if (response.status === 401) {
-        throw new RagHttpError(response.status, await response.text());
-      }
-      if (RETRYABLE_STATUSES.has(response.status) && attempt < 2) {
-        await sleep(250 * 2 ** attempt);
+      // Rate limited — retry
+      if (response.status === 429) {
+        logger.warn("RAG rate limited", { attempt });
+        lastError = new RagClientError(429, "Document search is busy. Retrying...");
         continue;
       }
+
+      // Auth failure — do NOT retry (caller should clear token cache and retry)
+      if (response.status === 401) {
+        throw new RagClientError(
+          401,
+          "Your session expired. Please send your question again.",
+          "Delegated token rejected by RAG",
+        );
+      }
+
+      // Forbidden — do NOT retry
+      if (response.status === 403) {
+        throw new RagClientError(
+          403,
+          "Identity verification error. Please try again.",
+          "RAG returned 403",
+        );
+      }
+
+      // Client error — our bug, do NOT retry
+      if (response.status === 400) {
+        const body = await response.text();
+        logger.error("RAG bad request (OpenClaw bug)", { body });
+        throw new RagClientError(400, "Something went wrong. Please try again.", body);
+      }
+
+      // Timeout
+      if (response.status === 408 || response.status === 504) {
+        throw new RagClientError(
+          response.status,
+          "Document search is taking longer than expected. Please try again.",
+        );
+      }
+
+      // Server error
+      if (response.status >= 500) {
+        throw new RagClientError(
+          response.status,
+          "I'm having trouble searching documents. Please try again.",
+        );
+      }
+
+      // Success
       if (!response.ok) {
-        throw new RagHttpError(response.status, await response.text());
+        throw new RagClientError(response.status, "Unexpected error searching documents.");
       }
 
       return (await response.json()) as RagSearchResponse;
@@ -62,15 +115,6 @@ export async function searchRag(
     }
   }
 
-  throw new Error("RAG request exhausted retries");
-}
-
-export class RagHttpError extends Error {
-  constructor(
-    public status: number,
-    public detail: string,
-  ) {
-    super(`RAG request failed: ${status}`);
-    this.name = "RagHttpError";
-  }
+  // All retries exhausted (429)
+  throw lastError ?? new RagClientError(429, "Document search is busy. Please try again later.");
 }
